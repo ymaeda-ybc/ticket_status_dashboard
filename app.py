@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 
 # ==========================================
@@ -16,13 +17,13 @@ st.title("🏀 アリーナ 座席検索マップ")
 st.caption("お手元のチケットに記載されている「階・エリア」「ブロック」「列」「番号」を選択してください。マップ上であなたの座席が赤く光ります。")
 
 # ==========================================
-# データ読み込み＆整形
+# データ読み込み＆斜め座席の角度・整列補正
 # ==========================================
 @st.cache_data
 def load_seat_master(csv_path):
     df = pd.read_csv(csv_path)
     
-    # "1F_バックA_7_1" のように「_」が3つある有効な座席データのみを抽出
+    # 有効な座席データのみを抽出
     valid_mask = df["SeatName"].astype(str).str.count("_") == 3
     df_valid = df[valid_mask].copy()
     
@@ -41,12 +42,47 @@ def load_seat_master(csv_path):
         df_valid["Row"] + "列 " + 
         df_valid["Number"] + "番"
     )
+
+    # ----------------------------------------------------
+    # ★ 斜め座席のマーカー回転角度（Angle）の設定
+    # 小数点座標になっている席（斜め変換された席）を検出し、
+    # 左側（X < 100）は +38度、右側（X > 100）は -38度 マーカー自体を傾ける
+    # ----------------------------------------------------
+    is_diagonal = (df_valid["X_Col"] % 1 != 0) | (df_valid["Y_Row"] % 1 != 0)
+    df_valid["Angle"] = np.where(
+        ~is_diagonal, 0,
+        np.where(df_valid["X_Col"] < 100, 38, -38)
+    )
+
+    # ----------------------------------------------------
+    # ★ 2FメインコーナーCの「同一列内の段差」を綺麗な一直線に補正
+    # ----------------------------------------------------
+    for side_cond, angle_deg in [((df_valid["X_Col"] < 100), 38.0), ((df_valid["X_Col"] > 100), -38.0)]:
+        mask_2fc = (df_valid["Floor"] == "2F") & (df_valid["Block"] == "メインコーナーC") & is_diagonal & side_cond
+        if mask_2fc.any():
+            sub = df_valid.loc[mask_2fc]
+            rad = np.radians(angle_deg)
+            # 回転後の法線方向（列が並ぶ方向）の座標を各列(Row_num)ごとに平均化して一直線に揃える
+            cos_a, sin_a = np.cos(rad), np.sin(rad)
+            # 平行成分(u)と垂直成分(v)に分解
+            u = sub["X_Col"] * cos_a + sub["Y_Row"] * sin_a
+            v = -sub["X_Col"] * sin_a + sub["Y_Row"] * cos_a
+            
+            # 同じ列(Row_num)の垂直成分(v)を平均値に統一して段差をなくす
+            v_aligned = v.groupby(sub["Row_num"]).transform("mean")
+            
+            df_valid.loc[mask_2fc, "X_Col"] = u * cos_a - v_aligned * sin_a
+            df_valid.loc[mask_2fc, "Y_Row"] = u * sin_a + v_aligned * cos_a
+
     return df_valid
 
+# ★ 読み込むファイル名を「座標マスタ_斜め変換後.csv」に指定
+CSV_FILE = "座標マスタ_斜め変換後.csv"
+
 try:
-    df_seats = load_seat_master("座標マスタ.csv")
+    df_seats = load_seat_master(CSV_FILE)
 except FileNotFoundError:
-    st.error("⚠️ 座席データ（座標マスタ.csv）が見つかりません。")
+    st.error(f"⚠️ 座席データ（{CSV_FILE}）が見つかりません。同じフォルダに配置してください。")
     st.stop()
 
 # ==========================================
@@ -89,17 +125,25 @@ with opt_col2:
     zoom_to_block = st.toggle("🔍 選んだブロック周辺を拡大する", value=False)
 
 # ==========================================
-# 3. マップ描画（全て通常のScatterで統一し、重なり順を完全制御）
+# 3. マップ描画（markerのangleで四角形自体も斜めに回転）
 # ==========================================
 fig = go.Figure()
 
 # ① 他ブロックの座席（薄いグレーの四角）
-other_blocks_df = df_seats[df_seats["Block"] != selected_block]
+is_selected_block = (df_seats["Floor"] == selected_floor) & (df_seats["Block"] == selected_block)
+other_blocks_df = df_seats[~is_selected_block]
+
 fig.add_trace(go.Scatter(
     x=other_blocks_df["X_Col"],
     y=other_blocks_df["Y_Row"],
     mode="markers",
-    marker=dict(symbol="square", size=7, color="#e8e8e8", line=dict(width=0.5, color="#cccccc")),
+    marker=dict(
+        symbol="square",
+        size=7,
+        angle=other_blocks_df["Angle"],  # ★ 斜めエリアの四角を38度傾ける
+        color="#e8e8e8",
+        line=dict(width=0.5, color="#cccccc")
+    ),
     hoverinfo="text",
     text=other_blocks_df["DisplayName"],
     name="他エリアの座席"
@@ -111,7 +155,13 @@ fig.add_trace(go.Scatter(
     x=same_block_others["X_Col"],
     y=same_block_others["Y_Row"],
     mode="markers",
-    marker=dict(symbol="square", size=8, color="#bbdefb", line=dict(width=0.5, color="#64b5f6")),
+    marker=dict(
+        symbol="square",
+        size=8,
+        angle=same_block_others["Angle"],  # ★ 斜めエリアの四角を38度傾ける
+        color="#bbdefb",
+        line=dict(width=0.5, color="#64b5f6")
+    ),
     hoverinfo="text",
     text=same_block_others["DisplayName"],
     name=f"{selected_floor} {selected_block}"
@@ -121,9 +171,10 @@ fig.add_trace(go.Scatter(
 if not target_df.empty:
     tx = float(target_df.iloc[0]["X_Col"])
     ty = float(target_df.iloc[0]["Y_Row"])
+    t_angle = float(target_df.iloc[0]["Angle"])
     t_name = target_df.iloc[0]["DisplayName"]
 
-    # 該当の座席マス自体を「赤色（#ff1744）」にする
+    # 該当の座席マス自体を「赤色（#ff1744）」にする（角度も合わせる）
     fig.add_trace(go.Scatter(
         x=[tx],
         y=[ty],
@@ -131,7 +182,8 @@ if not target_df.empty:
         marker=dict(
             symbol="square",
             size=14 if zoom_to_block else 11,
-            color="#ff1744",  # 鮮やかな赤色
+            angle=t_angle,  # ★ 選択された赤い四角も38度傾ける
+            color="#ff1744",
             line=dict(width=2, color="#ffffff")
         ),
         hoverinfo="text",
@@ -139,8 +191,8 @@ if not target_df.empty:
         name="あなたの座席"
     ))
 
-    # 円状の囲み（ズーム前は座席より上 "above"、ズーム時は座席の裏 "below" に自動切り替え）
-    radius = 4.5  # マップ座標上の半径（約4〜5席分の広がり）
+    # 円状の囲み（ズーム前は座席より上 "above"、ズーム時は座席の裏 "below"）
+    radius = 4.5
     fig.add_shape(
         type="circle",
         xref="x", yref="y",
@@ -178,7 +230,7 @@ else:
     x_range = None
     y_range = None
 
-# レイアウト調整（元のダッシュボードと同じ座標系・アスペクト比固定）
+# レイアウト調整
 fig.update_yaxes(autorange="reversed" if not zoom_to_block else None, range=y_range, visible=False)
 fig.update_xaxes(range=x_range, visible=False, scaleanchor="y", scaleratio=1)
 fig.update_layout(
